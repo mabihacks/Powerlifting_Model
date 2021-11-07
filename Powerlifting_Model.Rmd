@@ -1,0 +1,238 @@
+---
+title: "PowerLifting_Analysis"
+author: "Mabior Ater"
+date: "06/11/2021"
+output: pdf_document
+---
+
+###INTRO
+
+I am interested in the results of powerlifting events that are part of the international powerlifting federation. I aim to predict bench press with a multiple linear regression mdodel. In this research, I aim to answer the question of how much one can bench press. 
+
+We do come across a non-linear trend, so we make use of regression splines to asssess this case (additional research). 
+
+```{r cars}
+options(repos='http //cran.rstudio.com/')
+library(tidyverse)
+library(broom)
+library(splines)
+
+theme_set(theme_light())
+
+ipf_lifts_raw <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2019/2019-10-08/ipf_lifts.csv")
+```
+### Data Inspection 
+
+I can recognize that there are 3 categories of data: 
+1) Competitor: Name, Sex, Age and Weight 
+2) Event: The event type, division, age and weight class, and event details (name and date)
+3) Final results: Top results of the three types of lifts (squat, bench and deadlift) and the competitor's place in the event 
+
+```{r}
+ipf_lifts_raw %>%
+  glimpse()
+```
+
+### Exploratory Visualization 
+Ther eare two main events in this data: Bench-only, and Squat-Bench-Deadlift, so I will mainly use Squat-Bench-Deadlift since it gives a general overview of the data. However, the data is not as pretty, still requires cleaning. 
+```{r pressure, echo=FALSE}
+ipf_lifts_raw %>%
+  filter(event == "SBD") %>%
+  pivot_longer(cols = best3squat_kg:best3deadlift_kg,
+               names_to = "lift_type",
+               names_prefix = "best3",
+               values_to = "kg_lifted") %>%
+  ggplot(aes(lift_type, kg_lifted, fill = equipment)) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  facet_wrap(~ sex)
+```
+
+Some competitors did have negative left weights, which gives reason to apply filter_at.  And we can see the potential results from the data. 
+
+```{r}
+ipf_lifts_raw %>%
+  filter_at(vars(best3squat_kg, best3bench_kg, best3deadlift_kg), # Fields to filter
+            any_vars(. < 0)) %>% # Use . as a placeholder for the field name
+  select(best3squat_kg:place)
+```
+12 observation with negative lift weights, with all being disqualified. I will remove this from the observation and will re-run the exploratory graph. 
+
+```{r}
+ipf_lifts_raw %>%
+  filter(event == "SBD") %>%
+  pivot_longer(cols = best3squat_kg:best3deadlift_kg,
+               names_to = "lift_type",
+               names_prefix = "best3",
+               values_to = "kg_lifted") %>%
+  filter(kg_lifted > 0) %>% # WE JUST ADDED THIS FILTER
+  ggplot(aes(lift_type, kg_lifted, fill = equipment)) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  facet_wrap(~ sex)
+```
+Key observation are: 
+Men tend to lift more than women, and that men only used wraps 
+Additionally, competitors seem to lift more with single ply compared to raw lifting. (https://barbend.com/raw-vs-equipped-powerlifting/)
+However, seeing that only men used wraps is odd. So I will investigate this fully. 
+
+```{r}
+ipf_lifts_raw %>%
+  count(sex, equipment)
+```
+I see there is only 276 observation where wrap where used as an equipment, and majority of the lift where done by either raw or single-ply equipment. 
+
+### Data Cleaning 
+Key things to clean: 
+
+- Ditch fields that we aren’t interested in, only keeping bench weight and a few potential predictors.
+- Rename some fields so they’re nicer to work with.
+- Filter out missing or erroneous data among the fields we want to use to predict bench weight. Specifically, we’re going to exclude rows where the bench weight is negative or the age is less than 16.
+```{r}
+ipf_lifts <- ipf_lifts_raw %>%
+  # transmute acts like a combination of select and mutate
+  transmute(name,
+            sex,
+            equipment,
+            age,
+            weight_kg = bodyweight_kg,
+            bench_kg = best3bench_kg) %>%
+  # Filter out missing observations in age, weight, or bench weight
+  filter_at(vars(age, weight_kg, bench_kg),
+            all_vars(!is.na(.))) %>%
+  filter(equipment != "Wraps",
+         bench_kg > 0,
+         age >= 16)
+```
+
+### Modelling 
+
+I figure it's best to visualize the data to get a better udnerstanding between response variable (bench weight) and the predictors. This will help assess the question of how does a competitor weight, sex, and equipment relate to bench weight?
+
+```{r}
+ipf_lifts %>%
+  ggplot(aes(weight_kg, bench_kg)) +
+  geom_point(alpha = 0.2) +
+  facet_grid(equipment ~ sex)
+```
+So, the relationship appears to be linear, so we can favor that men tend to bench weights more than women, there are more men over 150kg (compared to none for women) and there is more variation in bench weight when single-ply equipment is in use. 
+
+Let's consider age 
+
+
+```{r}
+ipf_lifts %>%
+  ggplot(aes(age, bench_kg)) +
+  geom_point(alpha = 0.2) +
+  scale_x_continuous(breaks = seq(10, 90, 10)) +
+  # Same code as above -- we just added geom_smooth
+  geom_smooth(method = "loess", col = "red") +
+  facet_grid(equipment ~ sex)
+```
+There’s a clear relationship, but it’s not linear. It looks like competitors tend to lift more as they get older, until they peak in their 30s, then decline from there
+
+Now, to bulding our model between age and weight, we have to see if there's an correlation. If they are highly correlated, it will affect our regression. 
+```{r}
+ipf_lifts %>%
+  ggplot(aes(age, weight_kg)) +
+  geom_point(alpha = 0.2) +
+  scale_x_continuous(breaks = seq(10, 90, 10)) +
+  facet_wrap(~ sex)
+```
+
+
+```{r}
+cor(ipf_lifts$age, ipf_lifts$weight_kg)
+```
+Correlation is low, it is interesting 
+- we witness fewer heavier competitors as age increases 
+
+## Model Building
+We have a good idea about the relationship between bench weight and our predictors, so let’s take a moment to note what those relationships are. After we run our regression, we can check its output to see how well it lines up with our intuition.
+
+Sex: men tended to lift more than women
+Weight: heavier competitors tended to lift more than lighter competitors
+Equipment: equipped competitors (“Single-Ply”) tended to lift more than unequipped (“Raw”) competitors
+Age: competitors tended to lift the most in their 30s, but less if they were younger or older
+
+
+```{r}
+model_1 <- lm(bench_kg ~ sex + weight_kg + equipment + age,
+                  data = ipf_lifts)
+summary(model_1)
+```
+
+```{r}
+glance(model_1)
+```
+
+
+
+
+
+
+
+
+All of our predictors are statistically significant and we have an adjusted R-squared of 0.6793, which means that about 68% of the variance in bench weight is “explained” by these predictors. Everything lines up with our intuition, too:
+
+Sex: men are expected to lift about 53.4kg more than women
+Weight: competitors are expected to lift 1.3kg more for every additional 1kg of bodyweight
+Equipment: equipped competitors are expected to lift about 24.9kg more than unequipped competitors
+Age: older competitors are expected to lift less by about 0.6kg for every year of age
+
+Let's investigate age with residuals from our model
+
+```{r}
+model_1 %>%
+  augment() %>%
+  ggplot(aes(age, .resid)) +
+  geom_point(alpha = 0.2) +
+  geom_hline(aes(yintercept = 0), col = "red") +
+  scale_x_continuous(breaks = seq(10, 90, 10))
+```
+We’re overestimating bench weight for younger (in their teens and 20s) and older (aged 50+) competitors. 
+
+We should assess for non-linearity. We can do this by using a SPLINES model which will help assess for 
+(http://www.sthda.com/english/articles/40-regression-analysis/162-nonlinear-regression-essentials-in-r-polynomial-and-spline-regression-models/)
+
+```{r}
+splines <- tibble(degrees_of_freedom = 1:9) %>%
+  mutate(linear_model = map(degrees_of_freedom,
+                            ~ lm(bench_kg ~ ns(age, df = .), data = ipf_lifts)))
+
+splines %>%
+  mutate(augmented = map(linear_model, augment, data = ipf_lifts)) %>%
+  unnest(augmented) %>%
+  ggplot(aes(age, bench_kg)) +
+  geom_point(data = ipf_lifts, alpha = 0.1) +
+  geom_line(aes(y = .fitted), col = "red") +
+  scale_x_continuous(breaks = seq(10, 90, 10)) +
+  facet_wrap(~ degrees_of_freedom)
+```
+
+```{r}
+splines %>%
+  mutate(glanced = map(linear_model, glance, data = ipf_lifts)) %>%
+  unnest(glanced) %>%
+  select(degrees_of_freedom, adj.r.squared, AIC) %>%
+  pivot_longer(adj.r.squared:AIC) %>%
+  ggplot(aes(degrees_of_freedom, value)) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(breaks = 1:9) +
+  facet_wrap(~ name, scales = "free_y") +
+  theme(panel.grid.minor = element_blank())
+
+```
+This suggests that 3 degrees of freedom is a good predictor to use in our linear model. 
+
+```{r}
+splines_model <- lm(bench_kg ~ sex + weight_kg + equipment + ns(age, 3),
+                    data = ipf_lifts)
+summary(splines_model)
+```
+
+We lose some interpretability, since the estimates for each of the spline parameters aren’t obvious, but we seem to end up with a better model: an adjusted R-squared of 0.7296 compared to an adjusted R-squared of 0.6793 with our first model. 
+
+
+### Conclusion 
+
+We can conclude that 2nd model is much more preferable. As well, the use of splines to account for non-linear trends is very resourceful. However, for future models it will be important to assess the model in depth by using method like cross-validation to get more robust estimates. 
